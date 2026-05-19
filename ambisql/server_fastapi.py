@@ -8,6 +8,7 @@ import traceback
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from time import perf_counter
 from typing import Any, Dict, List, Optional
 
 import uvicorn
@@ -22,6 +23,7 @@ PARENT_DIR = CURR_DIR.parent
 sys.path.insert(0, str(PARENT_DIR))
 
 from ambisql.core.ambiguity_resolver import AmbiguityResolver
+from ambisql.core.schema_generator import SchemaGenerator
 from ambisql.utils.parse import (
     format_message,
     parse_schema_text,
@@ -31,14 +33,22 @@ from ambisql.utils.parse import (
 )
 from ambisql.utils.nl2sql_agent import XiYanAgent
 from ambisql.utils.llm_caller import LLMCaller
+from ambisql.utils.debug_logger import (
+    create_session_debug_logger,
+    create_system_debug_logger,
+)
 from ambisql.utils.db_utils import execute_query
 from ambisql.utils.usage_monitor import empty_usage_report, combine_usage_reports
 
+load_dotenv()
 
 db_path = str((CURR_DIR / "../MINIDEV/dev_databases").resolve())
 DEFAULT_PORT = int(os.environ.get("PORT", 8765))
-
-load_dotenv()
+DEFAULT_DB_NAME = os.environ.get("DEFAULT_DB_NAME", "pgim_property_finance")
+SCHEMA_ARTIFACTS_DIR = str(
+    (CURR_DIR.parent / "data" / "schema_artifacts").resolve()
+)
+SYSTEM_LOGGER = create_system_debug_logger("server_fastapi")
 
 app = FastAPI(title="AmbiSQL API", version="2.0.0")
 app.add_middleware(
@@ -50,6 +60,50 @@ app.add_middleware(
 )
 
 sessions: Dict[str, "ChatSession"] = {}
+
+
+@app.on_event("startup")
+async def preload_active_schema_bundle():
+    print(
+        f"[Startup] Preloading active schema artifact for database: {DEFAULT_DB_NAME}"
+    )
+    SYSTEM_LOGGER.log_event(
+        component="startup",
+        event="schema_preload_started",
+        payload={
+            "db_name": DEFAULT_DB_NAME,
+            "schema_artifacts_dir": SCHEMA_ARTIFACTS_DIR,
+        },
+    )
+    try:
+        schema_info = SchemaGenerator.preload_active_schema(
+            db_name=DEFAULT_DB_NAME,
+            artifacts_root=SCHEMA_ARTIFACTS_DIR,
+        )
+        print(
+            "[Startup] Active schema loaded: "
+            f"version={schema_info['schema_version']} "
+            f"tables={schema_info['table_count']}"
+        )
+        SYSTEM_LOGGER.log_event(
+            component="startup",
+            event="schema_preload_completed",
+            payload=schema_info,
+        )
+    except Exception as exc:
+        print("[Startup] Failed to preload active schema artifact")
+        SYSTEM_LOGGER.log_exception(
+            component="startup",
+            event="schema_preload_failed",
+            exception=exc,
+            payload={
+                "db_name": DEFAULT_DB_NAME,
+                "schema_artifacts_dir": SCHEMA_ARTIFACTS_DIR,
+            },
+        )
+        raise RuntimeError(
+            f"Unable to preload active schema artifact for {DEFAULT_DB_NAME}: {exc}"
+        ) from exc
 
 
 FOLLOW_UP_INTERPRETATION_PROMPT = """
@@ -97,6 +151,7 @@ Return ONLY valid JSON:
 
 Rules:
 - Use only the supplied SQL result. Do not guess or add outside knowledge.
+- Use the full SQL result rows provided below as the source of truth for the answer.
 - Keep the answer concise and directly answer the user's question.
 - Include inline citation markers in the answer, such as [rows 1-3] or [rows 1, 4].
 - If the result is empty, clearly say that no matching rows were returned and cite [query result].
@@ -111,8 +166,8 @@ Executed SQL:
 Result row count:
 {row_count}
 
-Result preview:
-{result_preview}
+Full SQL result rows:
+{result_rows}
 """
 
 
@@ -274,10 +329,11 @@ def build_confidence_report(
     }
 
 
-def build_result_preview(columns, rows, max_rows=20):
-    preview_rows = []
+def build_result_rows(columns, rows, max_rows=20): #currently we only return top 20 rows to avoid overwhelming the LLM, but this can be adjusted as needed
+    result_rows = []
+    # for index, row in enumerate(rows, start=1):
     for index, row in enumerate(rows[:max_rows], start=1):
-        preview_rows.append(
+        result_rows.append(
             {
                 "row_number": index,
                 "values": {
@@ -286,7 +342,7 @@ def build_result_preview(columns, rows, max_rows=20):
                 },
             }
         )
-    return preview_rows
+    return result_rows
 
 
 def build_result_citations(columns, rows, max_rows=20):
@@ -352,8 +408,25 @@ def build_query_metadata_citation(query_metadata):
     }
 
 
-def build_grounded_answer(question, sql_query, columns, rows, model="gpt4o-mini"):
+def build_grounded_answer(
+    question,
+    sql_query,
+    columns,
+    rows,
+    model="gpt4o-mini",
+    debug_logger=None,
+):
     if not rows:
+        if debug_logger:
+            debug_logger.log_event(
+                component="grounded_answer",
+                event="grounded_answer_empty_result",
+                payload={
+                    "question": question,
+                    "sql_query": sql_query,
+                    "row_count": 0,
+                },
+            )
         return {
             "answer": "No matching rows were returned by the executed query. [query result]",
             "citations": [
@@ -365,9 +438,13 @@ def build_grounded_answer(question, sql_query, columns, rows, model="gpt4o-mini"
             "usage_report": empty_usage_report("SQL generation"),
         }
 
-    llm_caller = LLMCaller(model)
-    result_preview = json.dumps(
-        build_result_preview(columns, rows),
+    llm_caller = LLMCaller(
+        model,
+        debug_logger=debug_logger,
+        component="grounded_answer",
+    )
+    result_rows = json.dumps(
+        build_result_rows(columns, rows),
         ensure_ascii=False,
         indent=2,
         default=str,
@@ -376,7 +453,7 @@ def build_grounded_answer(question, sql_query, columns, rows, model="gpt4o-mini"
         question=question,
         sql_query=sql_query,
         row_count=len(rows),
-        result_preview=result_preview,
+        result_rows=result_rows,
     )
     query = [
         {
@@ -387,18 +464,35 @@ def build_grounded_answer(question, sql_query, columns, rows, model="gpt4o-mini"
     ]
 
     try:
-        response = llm_caller.call(query)
+        response = llm_caller.call(
+            query,
+            operation="grounded_answer_generation",
+            metadata={
+                "question": question,
+                "row_count": len(rows),
+                "columns": columns,
+            },
+        )
         parsed = parse_json_response(response)
         answer = parsed.get("answer", "").strip()
         citations = parsed.get("citations", [])
         if not answer:
             raise ValueError("Grounded answer is empty.")
+        if debug_logger:
+            debug_logger.log_event(
+                component="grounded_answer",
+                event="grounded_answer_completed",
+                payload={
+                    "answer": answer,
+                    "citations": citations,
+                },
+            )
         return {
             "answer": answer,
             "citations": citations,
             "usage_report": llm_caller.get_usage_report("SQL generation"),
         }
-    except Exception:
+    except Exception as exc:
         first_row = rows[0]
         row_summary = ", ".join(
             f"{column}={first_row[position]!r}"
@@ -408,6 +502,16 @@ def build_grounded_answer(question, sql_query, columns, rows, model="gpt4o-mini"
             f"The query returned {len(rows)} row(s). "
             f"The first row is {row_summary}. [row 1]"
         )
+        if debug_logger:
+            debug_logger.log_exception(
+                component="grounded_answer",
+                event="grounded_answer_fallback_used",
+                exception=exc,
+                payload={
+                    "fallback_answer": fallback_answer,
+                    "row_count": len(rows),
+                },
+            )
         return {
             "answer": fallback_answer,
             "citations": build_result_citations(columns, rows),
@@ -425,9 +529,18 @@ def build_recent_history_text(session, limit=6):
     )
 
 
-def interpret_user_question(current_session, new_question, model, db_name):
+def interpret_user_question(current_session, new_question, model, db_name, debug_logger=None):
     previous_question = (current_session.question or "").strip()
     if not previous_question:
+        if debug_logger:
+            debug_logger.log_event(
+                component="conversation_interpretation",
+                event="new_question_without_history",
+                payload={
+                    "new_question": new_question.strip(),
+                    "db_name": db_name,
+                },
+            )
         return {
             "mode": "new_question",
             "standalone_question": new_question.strip(),
@@ -435,13 +548,27 @@ def interpret_user_question(current_session, new_question, model, db_name):
         }
 
     if current_session.db_name and current_session.db_name != db_name:
+        if debug_logger:
+            debug_logger.log_event(
+                component="conversation_interpretation",
+                event="new_question_due_to_database_change",
+                payload={
+                    "previous_db_name": current_session.db_name,
+                    "new_db_name": db_name,
+                    "new_question": new_question.strip(),
+                },
+            )
         return {
             "mode": "new_question",
             "standalone_question": new_question.strip(),
             "usage_report": empty_usage_report("Conversation interpretation"),
         }
 
-    llm_caller = LLMCaller(model)
+    llm_caller = LLMCaller(
+        model,
+        debug_logger=debug_logger,
+        component="conversation_interpretation",
+    )
     prompt = FOLLOW_UP_INTERPRETATION_PROMPT.format(
         previous_question=previous_question,
         recent_history=build_recent_history_text(current_session),
@@ -456,7 +583,14 @@ def interpret_user_question(current_session, new_question, model, db_name):
     ]
 
     try:
-        response = llm_caller.call(query)
+        response = llm_caller.call(
+            query,
+            operation="interpret_user_question",
+            metadata={
+                "previous_question": previous_question,
+                "db_name": db_name,
+            },
+        )
         parsed = parse_json_response(response)
         mode = parsed.get("mode", "new_question")
         standalone_question = (
@@ -490,6 +624,15 @@ class ChatSession:
         self.ambiguity_usage = empty_usage_report("Ambiguity workflow")
         self.sql_generation_usage = empty_usage_report("SQL generation")
         self.question_mode = "new_question"
+        self.debug_logger = create_session_debug_logger(session_id)
+        self.debug_logger.log_event(
+            component="session",
+            event="session_created",
+            payload={
+                "session_id": session_id,
+                "created_at": self.created_at,
+            },
+        )
 
     def add_message(self, role, content):
         timestamp = datetime.now().isoformat()
@@ -525,6 +668,14 @@ def get_or_create_session(client_session_id: Optional[str]):
         current_session = sessions[session_id]
         current_session.last_accessed = datetime.now().isoformat()
         print(f"  Using existing session: {session_id}")
+        current_session.debug_logger.log_event(
+            component="session",
+            event="session_reused",
+            payload={
+                "session_id": session_id,
+                "last_accessed": current_session.last_accessed,
+            },
+        )
         return session_id, current_session
 
     session_id = str(uuid.uuid4())
@@ -536,28 +687,92 @@ def get_or_create_session(client_session_id: Optional[str]):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    active_schema = SchemaGenerator.get_runtime_cache_metadata(
+        artifacts_root=SCHEMA_ARTIFACTS_DIR
+    )
+    return {
+        "status": "ok",
+        "active_schema": active_schema,
+    }
+
+
+def build_request_id(prefix):
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def elapsed_ms(start_time):
+    return round((perf_counter() - start_time) * 1000, 3)
+
+
+def safe_char_len(value):
+    if value is None:
+        return 0
+    return len(str(value))
+
+
+def build_request_observability_summary(
+    request_id,
+    endpoint,
+    session,
+    stage_latencies_ms,
+    extra=None,
+):
+    monitoring = build_session_monitoring(session)
+    summary = {
+        "request_id": request_id,
+        "endpoint": endpoint,
+        "session_id": session.session_id,
+        "schema_version": (
+            SchemaGenerator.get_runtime_cache_metadata(
+                artifacts_root=SCHEMA_ARTIFACTS_DIR
+            )[0]["schema_version"]
+            if SchemaGenerator.get_runtime_cache_metadata(
+                artifacts_root=SCHEMA_ARTIFACTS_DIR
+            )
+            else None
+        ),
+        "stage_latencies_ms": stage_latencies_ms,
+        "usage": monitoring,
+    }
+    if extra:
+        summary.update(extra)
+    return summary
 
 
 @app.post("/api/sql/analyze")
 async def analyze_sql_query(payload: Dict[str, Any] = Body(...)):
     try:
         print("\n[SQL Query Analysis] Processing request...")
+        request_start = perf_counter()
+        stage_latencies_ms = {}
+        request_id = build_request_id("analyze")
 
         client_session_id = payload.get("session_id")
         session_id, current_session = get_or_create_session(client_session_id)
+        current_session.debug_logger.set_request_id(request_id)
+        current_session.debug_logger.log_event(
+            component="analyze_api",
+            event="analyze_request_received",
+            payload={
+                "request_id": request_id,
+                "payload": payload,
+            },
+        )
 
         raw_question = payload.get("question", "")
         dialect = payload.get("dialect", "SQLite")
-        db_name = payload.get("db", "")
+        db_name = payload.get("db", "") or DEFAULT_DB_NAME
         model = "gpt4o-mini"
 
+        interpretation_start = perf_counter()
         interpretation = interpret_user_question(
             current_session=current_session,
             new_question=raw_question,
             model=model,
             db_name=db_name,
+            debug_logger=current_session.debug_logger,
         )
+        stage_latencies_ms["conversation_interpretation"] = elapsed_ms(interpretation_start)
         question = interpretation["standalone_question"]
         question_mode = interpretation["mode"]
         current_session.db_name = db_name
@@ -569,21 +784,64 @@ async def analyze_sql_query(payload: Dict[str, Any] = Body(...)):
         print(f"  Interpreted question: {question}")
         print(f"  Question mode: {question_mode}")
         print(f"  Database: {db_name} | Dialect: {dialect} | Model: {model}")
+        current_session.debug_logger.log_event(
+            component="analyze_api",
+            event="question_interpreted",
+            payload={
+                "request_id": request_id,
+                "raw_question": raw_question,
+                "interpreted_question": question,
+                "question_mode": question_mode,
+                "db_name": db_name,
+                "dialect": dialect,
+                "model": model,
+                "raw_question_characters": safe_char_len(raw_question),
+                "interpreted_question_characters": safe_char_len(question),
+            },
+        )
 
-        qr_instance = AmbiguityResolver(db_name, db_path, question, model)
+        resolver_start = perf_counter()
+        qr_instance = AmbiguityResolver(
+            db_name,
+            db_path,
+            question,
+            model,
+            debug_logger=current_session.debug_logger,
+        )
+        stage_latencies_ms["resolver_initialization"] = elapsed_ms(resolver_start)
         print("  Created Ambiguity Resolver instance")
         current_session.question_rewriter_instance = qr_instance
 
         schema_text = qr_instance.schema_generator.formatted_full_schema
         parsed_schema = parse_schema_text(schema_text)
         print(f"  Schema parsed: {len(parsed_schema)} tables")
+        current_session.debug_logger.log_event(
+            component="analyze_api",
+            event="schema_loaded_for_analysis",
+            payload={
+                "request_id": request_id,
+                "schema_version": getattr(qr_instance.schema_generator, "schema_version", None),
+                "table_count": len(parsed_schema),
+            },
+        )
 
         print("  Starting ambiguity detection...")
+        ambiguity_detection_start = perf_counter()
         response_json = qr_instance.ambi_detection()
+        stage_latencies_ms["ambiguity_detection"] = elapsed_ms(ambiguity_detection_start)
         response = json.loads(response_json)
         print(f"  Detection result: {response}")
         question_set = response.get("question_set") or []
         print(f"  Identified {len(question_set)} ambiguity question(s)")
+        current_session.debug_logger.log_event(
+            component="analyze_api",
+            event="analyze_response_ready",
+            payload={
+                "request_id": request_id,
+                "ambiguity_count": len(question_set),
+                "ambiguities": question_set,
+            },
+        )
 
         current_session.ambiguity_usage = combine_usage_reports(
             [
@@ -605,7 +863,9 @@ async def analyze_sql_query(payload: Dict[str, Any] = Body(...)):
                 "Your question is specific enough. I can move directly toward SQL generation.",
             )
 
-        return {
+        stage_latencies_ms["total_request"] = elapsed_ms(request_start)
+        response_payload = {
+            "request_id": request_id,
             "session_id": session_id,
             "suggested_schema": parsed_schema,
             "analysis": "Schema analysis completed",
@@ -625,10 +885,57 @@ async def analyze_sql_query(payload: Dict[str, Any] = Body(...)):
             ),
             "monitoring": build_session_monitoring(current_session),
         }
+        current_session.debug_logger.log_event(
+            component="analyze_api",
+            event="analyze_request_summary",
+            payload=build_request_observability_summary(
+                request_id=request_id,
+                endpoint="/api/sql/analyze",
+                session=current_session,
+                stage_latencies_ms=stage_latencies_ms,
+                extra={
+                    "ambiguity_count": len(question_set),
+                    "question_mode": question_mode,
+                    "estimated_cost_usd": build_session_monitoring(current_session)[
+                        "session_total"
+                    ]["estimated_cost_usd"],
+                    "schema_version": getattr(
+                        qr_instance.schema_generator,
+                        "schema_version",
+                        None,
+                    ),
+                },
+            ),
+        )
+        current_session.debug_logger.clear_request_id()
+        return response_payload
 
     except Exception as e:
         print("\n[Error] Exception occurred during SQL query analysis")
         print(f"  Error message: {str(e)}")
+        if "current_session" in locals() and current_session is not None:
+            current_session.debug_logger.log_exception(
+                component="analyze_api",
+                event="analyze_request_failed",
+                exception=e,
+                payload={
+                    "request_id": locals().get("request_id"),
+                    "payload": payload,
+                    "stage_latencies_ms": locals().get("stage_latencies_ms"),
+                },
+            )
+            current_session.debug_logger.clear_request_id()
+        else:
+            SYSTEM_LOGGER.log_exception(
+                component="analyze_api",
+                event="analyze_request_failed_without_session",
+                exception=e,
+                payload={
+                    "request_id": locals().get("request_id"),
+                    "payload": payload,
+                    "stage_latencies_ms": locals().get("stage_latencies_ms"),
+                },
+            )
         raise HTTPException(
             status_code=500,
             detail={
@@ -643,6 +950,9 @@ async def resolve_ambiguities(payload: Dict[str, Any] = Body(...)):
     print("\n[Ambiguity Resolution] Starting ambiguity resolution request processing")
 
     try:
+        request_start = perf_counter()
+        stage_latencies_ms = {}
+        request_id = build_request_id("resolve")
         print(
             f"  [Request Data] Received JSON data: "
             f"{json.dumps(payload, indent=2, ensure_ascii=False)}"
@@ -663,6 +973,15 @@ async def resolve_ambiguities(payload: Dict[str, Any] = Body(...)):
                 status_code=404,
                 detail={"error": "Session not found or expired"},
             )
+        current_session.debug_logger.set_request_id(request_id)
+        current_session.debug_logger.log_event(
+            component="resolve_api",
+            event="resolve_request_received",
+            payload={
+                "request_id": request_id,
+                "payload": payload,
+            },
+        )
 
         qr_instance = current_session.question_rewriter_instance
         print(f"  [Ambiguity Resolver] QuestionRewriter instance from session: {qr_instance}")
@@ -701,15 +1020,36 @@ async def resolve_ambiguities(payload: Dict[str, Any] = Body(...)):
         print(f"  [Message Formatting] Formatted message: {formatted_message}")
         if qa_set or additional_info.strip():
             current_session.add_message("user", formatted_message)
+        current_session.debug_logger.log_event(
+            component="resolve_api",
+            event="clarification_payload_prepared",
+            payload={
+                "request_id": request_id,
+                "qa_set": qa_set,
+                "additional_info": additional_info,
+                "formatted_message": formatted_message,
+                "formatted_message_characters": safe_char_len(formatted_message),
+            },
+        )
 
         print("  [Ambiguity Correction] Calling qr_instance.ambi_correction for clarification processing...")
+        ambiguity_correction_start = perf_counter()
         response_json = qr_instance.ambi_correction(message=formatted_message)
+        stage_latencies_ms["ambiguity_correction"] = elapsed_ms(ambiguity_correction_start)
         print(f"  [Ambiguity Correction] ambi_correction returned: {response_json}")
 
         parsed_response = json.loads(response_json)
         print(
             f"  [Response Parsing] Parsed response: "
             f"{json.dumps(parsed_response, indent=2, ensure_ascii=False)}"
+        )
+        current_session.debug_logger.log_event(
+            component="resolve_api",
+            event="ambiguity_correction_parsed",
+            payload={
+                "request_id": request_id,
+                "parsed_response": parsed_response,
+            },
         )
         current_session.ambiguity_usage = qr_instance.llm_caller.get_usage_report(
             label="Ambiguity workflow"
@@ -718,6 +1058,7 @@ async def resolve_ambiguities(payload: Dict[str, Any] = Body(...)):
         if "has_ambiguity" in parsed_response or parsed_response["is_clarified"] is False:
             print("  [Result] Ambiguities still exist, returning ambiguity question set")
             response_data = {
+                "request_id": request_id,
                 "is_clarified": "False",
                 "session_id": session_id,
                 "ambiguities": parsed_response["question_set"],
@@ -726,32 +1067,73 @@ async def resolve_ambiguities(payload: Dict[str, Any] = Body(...)):
                 "assistant",
                 f"I still need {len(parsed_response['question_set'] or [])} clarification question(s).",
             )
+            current_session.debug_logger.log_event(
+                component="resolve_api",
+                event="clarification_still_required",
+                payload={
+                    "request_id": request_id,
+                    "ambiguity_count": len(parsed_response["question_set"] or []),
+                    "ambiguities": parsed_response["question_set"],
+                },
+            )
         else:
             print("  [Result] Ambiguities clarified, starting SQL query generation")
 
-            sql_agent = XiYanAgent()
+            sql_agent = XiYanAgent(debug_logger=current_session.debug_logger)
+            sql_generation_start = perf_counter()
             sql_clarified = sql_agent.generate_sql(
                 parsed_response["question"],
                 parsed_response["evidence"],
                 qr_instance.schema_generator.formatted_full_schema,
             )
+            stage_latencies_ms["sql_generation"] = elapsed_ms(sql_generation_start)
             sql_clarified = add_semicolon_if_missing(normalize_sql_query(sql_clarified))
             print(f"  [SQL Generation] Clarified SQL statement: {sql_clarified}")
+            current_session.debug_logger.log_event(
+                component="resolve_api",
+                event="sql_normalized",
+                payload={
+                    "request_id": request_id,
+                    "sql_statement": sql_clarified,
+                    "sql_characters": safe_char_len(sql_clarified),
+                },
+            )
 
+            sql_execution_start = perf_counter()
             query_execution = execute_query(
                 db_path,
                 current_session.db_name,
                 sql_clarified,
                 include_columns=True,
             )
+            stage_latencies_ms["sql_execution"] = elapsed_ms(sql_execution_start)
             print(f"  [SQL Execution] Returned {len(query_execution['rows'])} row(s)")
+            current_session.debug_logger.log_event(
+                component="sql_execution",
+                event="sql_execution_completed",
+                payload={
+                    "request_id": request_id,
+                    "db_name": current_session.db_name,
+                    "row_count": len(query_execution["rows"]),
+                    "columns": query_execution["columns"],
+                    "result_preview": build_result_rows(
+                        query_execution["columns"],
+                        query_execution["rows"],
+                    ),
+                },
+            )
 
+            grounded_answer_start = perf_counter()
             grounded_answer = build_grounded_answer(
                 parsed_response["question"],
                 sql_clarified,
                 query_execution["columns"],
                 query_execution["rows"],
                 model="gpt4o-mini",
+                debug_logger=current_session.debug_logger,
+            )
+            stage_latencies_ms["grounded_answer_generation"] = elapsed_ms(
+                grounded_answer_start
             )
             query_metadata = extract_query_metadata(
                 sql_clarified,
@@ -772,6 +1154,7 @@ async def resolve_ambiguities(payload: Dict[str, Any] = Body(...)):
             )
 
             response_data = {
+                "request_id": request_id,
                 "session_id": session_id,
                 "is_clarified": "True",
                 "sql_statement_clarified": sql_clarified,
@@ -785,6 +1168,17 @@ async def resolve_ambiguities(payload: Dict[str, Any] = Body(...)):
                 },
             }
             current_session.add_message("assistant", grounded_answer["answer"])
+            current_session.debug_logger.log_event(
+                component="resolve_api",
+                event="final_answer_ready",
+                payload={
+                    "request_id": request_id,
+                    "sql_statement": sql_clarified,
+                    "grounded_answer": grounded_answer["answer"],
+                    "query_metadata": query_metadata,
+                    "row_count": response_data["query_result"]["row_count"],
+                },
+            )
 
         if response_data["is_clarified"] == "False":
             response_data["confidence"] = build_confidence_report(
@@ -810,16 +1204,80 @@ async def resolve_ambiguities(payload: Dict[str, Any] = Body(...)):
             )
 
         response_data["monitoring"] = build_session_monitoring(current_session)
+        stage_latencies_ms["total_request"] = elapsed_ms(request_start)
+        current_session.debug_logger.log_event(
+            component="resolve_api",
+            event="resolve_response_sent",
+            payload={
+                "request_id": request_id,
+                "is_clarified": response_data["is_clarified"],
+                "confidence": response_data["confidence"],
+            },
+        )
+        current_session.debug_logger.log_event(
+            component="resolve_api",
+            event="resolve_request_summary",
+            payload=build_request_observability_summary(
+                request_id=request_id,
+                endpoint="/api/sql/resolve",
+                session=current_session,
+                stage_latencies_ms=stage_latencies_ms,
+                extra={
+                    "is_clarified": response_data["is_clarified"],
+                    "ambiguity_count": len(response_data.get("ambiguities") or []),
+                    "row_count": (
+                        response_data.get("query_result", {}).get("row_count")
+                        if response_data["is_clarified"] == "True"
+                        else None
+                    ),
+                    "sql_characters": safe_char_len(
+                        response_data.get("sql_statement_clarified")
+                    ),
+                    "grounded_answer_characters": safe_char_len(
+                        response_data.get("grounded_answer")
+                    ),
+                    "estimated_cost_usd": response_data["monitoring"]["session_total"][
+                        "estimated_cost_usd"
+                    ],
+                },
+            ),
+        )
+        current_session.debug_logger.clear_request_id()
 
         print("  [Result] Processing completed, returning response data")
         return response_data
 
     except HTTPException:
+        if "current_session" in locals() and current_session is not None:
+            current_session.debug_logger.clear_request_id()
         raise
     except Exception as e:
         print("\n[Error] Exception occurred during ambiguity resolution")
         print(f"  Error message: {str(e)}")
         traceback.print_exc()
+        if "current_session" in locals() and current_session is not None:
+            current_session.debug_logger.log_exception(
+                component="resolve_api",
+                event="resolve_request_failed",
+                exception=e,
+                payload={
+                    "request_id": locals().get("request_id"),
+                    "payload": payload,
+                    "stage_latencies_ms": locals().get("stage_latencies_ms"),
+                },
+            )
+            current_session.debug_logger.clear_request_id()
+        else:
+            SYSTEM_LOGGER.log_exception(
+                component="resolve_api",
+                event="resolve_request_failed_without_session",
+                exception=e,
+                payload={
+                    "request_id": locals().get("request_id"),
+                    "payload": payload,
+                    "stage_latencies_ms": locals().get("stage_latencies_ms"),
+                },
+            )
         raise HTTPException(
             status_code=500,
             detail={
@@ -835,7 +1293,7 @@ if __name__ == "__main__":
     print("  Reload mode: True")
     print()
     uvicorn.run(
-        "ambisql.server_2:app",
+        "ambisql.server_fastapi:app",
         host="0.0.0.0",
         port=DEFAULT_PORT,
         reload=True,

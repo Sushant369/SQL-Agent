@@ -84,7 +84,13 @@ class PreferenceTree:
             },
             {"role": "user", "content": node_merge_prompt},
         ]
-        response = self.llm_caller.call(query)
+        response = self.llm_caller.call(
+            query,
+            operation="preference_node_merge",
+            metadata={
+                "existing_pairs": len(qa_list),
+            },
+        )
         print(response)
         response = response.strip('`json\n ')
         print(response)

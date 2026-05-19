@@ -35,7 +35,15 @@ class CQGenerator:
             ]
 
             try:
-                raw_response = llm_caller.call(query)
+                raw_response = llm_caller.call(
+                    query,
+                    operation="clarification_question_generation",
+                    metadata={
+                        "question": item["question"],
+                        "level_1_label": item.get("level_1_label"),
+                        "level_2_label": item.get("level_2_label"),
+                    },
+                )
                 parsed_response = parse_json_response(raw_response)
                 
                 choices_list = parsed_response.get('choices', [])

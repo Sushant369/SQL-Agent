@@ -23,7 +23,7 @@ class AmbiguityResolver:
     This class detects ambiguities in user questions, generates clarification questions,
     and refines questions based on user responses to produce unambiguous SQL queries.
     """
-    def __init__(self, db_name, path, question, model):
+    def __init__(self, db_name, path, question, model, debug_logger=None):
         """
         Initialize the ambiguity resolver.
         
@@ -36,10 +36,26 @@ class AmbiguityResolver:
         self.db_name = db_name
         self.path = path
         self.question = question
-        self.llm_caller = LLMCaller(model)
+        self.debug_logger = debug_logger
+        self.llm_caller = LLMCaller(
+            model,
+            debug_logger=debug_logger,
+            component="ambiguity_workflow",
+        )
         self.schema_generator = SchemaGenerator(db_name, path, question)
         self.intention_model = PreferenceTree(self.llm_caller)
         self.cq_generator = CQGenerator()
+        if self.debug_logger:
+            self.debug_logger.log_event(
+                component="ambiguity_workflow",
+                event="resolver_initialized",
+                payload={
+                    "db_name": db_name,
+                    "question": question,
+                    "schema_version": getattr(self.schema_generator, "schema_version", None),
+                    "table_count": len(self.schema_generator.formatted_full_schema_json),
+                },
+            )
         
     def ambi_detection(self):
         """
@@ -51,6 +67,16 @@ class AmbiguityResolver:
             - Refined question and evidence if no ambiguities (is_clarified=True)
         """
         flag, question_set = self.check_ambiguity()
+        if self.debug_logger:
+            self.debug_logger.log_event(
+                component="ambiguity_workflow",
+                event="initial_ambiguity_result",
+                payload={
+                    "has_ambiguity": flag,
+                    "question_count": len(question_set or []),
+                    "question_set": question_set,
+                },
+            )
         if flag:          
             question_set = self.rewrite_clarification_question(question_set)
             return format_response(is_clarified=False, q_set=question_set)
@@ -73,6 +99,16 @@ class AmbiguityResolver:
         flag = None
         message_parsed = json.loads(message)
         self.intention_model.update_tree(message_parsed["qa_set"])
+        if self.debug_logger:
+            self.debug_logger.log_event(
+                component="ambiguity_workflow",
+                event="clarification_memory_updated",
+                payload={
+                    "qa_set": message_parsed["qa_set"],
+                    "additional_info": message_parsed["additional_info"],
+                    "evidence": self.intention_model.traverse(),
+                },
+            )
         if not message_parsed["qa_set"] and message_parsed["additional_info"].strip() == "":
             flag = False
         else:
@@ -129,13 +165,39 @@ class AmbiguityResolver:
             {"role": "system", "content": "You are a helpful assistant to find out inherent ambiguity in a natural language statement. Return only the result with no explanation."},
             {"role": "user", "content": ambiguity_detection_prompt},
         ]
-        response = self.llm_caller.call(query)
+        response = self.llm_caller.call(
+            query,
+            operation="ambiguity_detection",
+            metadata={
+                "initial_detection": initial_detection,
+                "question": self.question,
+            },
+        )
         res = parse_json_response(response)
+        if self.debug_logger:
+            self.debug_logger.log_event(
+                component="ambiguity_workflow",
+                event="ambiguity_detection_parsed",
+                payload={
+                    "initial_detection": initial_detection,
+                    "raw_result": res,
+                },
+            )
 
         if res["has_ambiguity"]:
             filtered_question_set = self.filter_false_positive_ambiguities(
                 res["question_set"], self.question
             )
+            if self.debug_logger:
+                self.debug_logger.log_event(
+                    component="ambiguity_workflow",
+                    event="ambiguity_filter_applied",
+                    payload={
+                        "original_question_count": len(res["question_set"] or []),
+                        "filtered_question_count": len(filtered_question_set or []),
+                        "filtered_question_set": filtered_question_set,
+                    },
+                )
             if filtered_question_set:
                 return True, filtered_question_set
             return False, None
@@ -288,7 +350,23 @@ class AmbiguityResolver:
             {"role": "system", "content": "You are an expert specializing in query refinement. Your purpose is to merge and consolidate user questions with new information. Respond ONLY with the refined question. Do not add any explanation, formatting, or extra text."},
             {"role": "user", "content": question_refine_prompt},
         ]
-        response = self.llm_caller.call(query)
+        response = self.llm_caller.call(
+            query,
+            operation="question_refinement",
+            metadata={
+                "additional_info": additional_info,
+            },
+        )
+        if self.debug_logger:
+            self.debug_logger.log_event(
+                component="ambiguity_workflow",
+                event="question_refined",
+                payload={
+                    "original_question": self.question,
+                    "additional_info": additional_info,
+                    "refined_question": response,
+                },
+            )
         return response
 
     def rewrite_clarification_question(self, question_set: List[dict]):
@@ -323,4 +401,10 @@ class AmbiguityResolver:
             "question_set" : None,
             "evidence": intention_model.traverse()
         }
+        if self.debug_logger:
+            self.debug_logger.log_event(
+                component="ambiguity_workflow",
+                event="clarified_response_ready",
+                payload=response,
+            )
         return json.dumps(response, ensure_ascii=False) 

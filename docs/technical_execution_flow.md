@@ -1,51 +1,307 @@
 # AmbiSQL Technical Execution Flow
 
-This document explains the detailed execution flow and technical implementation of the current AmbiSQL backend, with the FastAPI backend in `ambisql/server_2.py` as the primary runtime reference.
+This document explains the current AmbiSQL architecture and end-to-end runtime flow, using the FastAPI backend in `ambisql/server_fastapi.py` as the primary reference.
 
-The explanation is organized around three core stages:
+The current design has four major stages:
 
-1. Understanding user intent and asking clarification questions
-2. Mapping business tables to clarified intent and generating SQL
-3. Executing SQL and generating grounded answers with citations
+1. Offline database and schema-artifact preparation
+2. Startup-time schema preload
+3. Runtime ambiguity detection and clarification
+4. SQL generation, execution, grounded answering, and traceability
+5. Structured debug logging and observability
+
+This document also includes a full "run from scratch" guide at the end.
 
 ---
 
 ## 1. System Overview
 
-At runtime, the system is driven by two main API endpoints exposed by `ambisql/server_2.py`:
+At runtime, the system is driven by two API endpoints exposed by `ambisql/server_fastapi.py`:
 
 - `POST /api/sql/analyze`
 - `POST /api/sql/resolve`
 
-The high-level control flow is:
+The high-level control flow is now:
 
-1. The user submits a question through the UI.
-2. The backend decides whether the question is a new request or a follow-up to the previous turn.
-3. The backend constructs a business-aware schema representation from the SQLite database plus curated metadata CSVs.
-4. The ambiguity engine checks whether the question is underspecified.
-5. If ambiguity exists, the backend returns targeted clarification questions.
-6. Once the user clarifies the request, the backend generates SQL from the clarified intent and the grounded schema.
-7. The SQL is executed on the SQLite database.
-8. The result rows are summarized into a grounded natural-language answer.
-9. The backend returns SQL, answer, query result preview, and citations for traceability.
+1. The database and metadata are prepared offline.
+2. A versioned schema artifact is built offline and promoted via `ACTIVE_VERSION`.
+3. The backend starts and preloads the active schema artifact into memory.
+4. The user submits a question through the UI.
+5. The backend decides whether the question is a new request or a follow-up.
+6. The ambiguity engine checks whether the question is underspecified.
+7. If ambiguity exists, the backend returns targeted clarification questions.
+8. Once the user clarifies the request, the backend generates SQL from the clarified intent and preloaded schema.
+9. The SQL is executed on the SQLite database.
+10. The result rows are summarized into a grounded natural-language answer.
+11. The backend returns SQL, answer, citations, confidence, and query result preview.
+12. Structured debug logs are written locally for startup, request tracing, model calls, SQL execution, and fallback behavior.
 
-This architecture is intentionally not a pure text-generation pipeline. It is a controlled workflow that combines:
+The important production-oriented change is that schema construction is no longer intended to happen on every user query. Instead, schema is packaged into a versioned artifact and loaded into memory at service startup.
 
-- LLM-based semantic understanding
-- business schema grounding
-- interactive ambiguity resolution
-- actual SQL execution on the database
-- evidence-backed answer generation
+The current backend also includes structured local observability so that each session and request can be traced across the ambiguity workflow, SQL generation, execution, and grounded-answer stages.
 
 ---
 
-## 2. Stage One: Understanding User Intent and Asking Clarification Questions
+## 2. Offline Preparation Layer
 
-### 2.1 API entrypoint and session model
+### 2.1 Database creation from the source workbook
 
-The process starts in `ambisql/server_2.py` inside `analyze_sql_query`.
+For the current local project setup, the starting data source is:
 
-The backend maintains in-memory conversation sessions using the `ChatSession` class. Each session stores:
+- `data/pgim_property_finance_dummy_data.xlsx`
+
+The script:
+
+- `scripts/import_pgim_excel.py`
+
+parses the workbook and creates:
+
+- a SQLite database at `MINIDEV/dev_databases/pgim_property_finance/pgim_property_finance.sqlite`
+- schema description CSV files under `MINIDEV/dev_databases/pgim_property_finance/database_description/`
+
+The script performs the following:
+
+1. Reads workbook sheets from the Excel file.
+2. Normalizes sheet names into SQLite table names.
+3. Normalizes column names.
+4. Infers SQL column types.
+5. Creates SQLite tables.
+6. Inserts workbook rows into SQLite.
+7. Generates metadata CSV files with:
+   - `original_column_name`
+   - `column_description`
+   - `value_description`
+
+This gives AmbiSQL both:
+
+- physical schema structure from SQLite
+- semantic business metadata from CSV files
+
+### 2.2 Offline schema artifact build
+
+The current project now supports an offline schema packaging step via:
+
+- `scripts/build_schema_artifact.py`
+
+This script uses:
+
+- `ambisql/core/schema_generator.py`
+
+to read:
+
+- the SQLite database
+- the `database_description/*.csv` files
+
+and construct a versioned schema bundle containing:
+
+- `db_name`
+- `schema_version`
+- `built_at_utc`
+- `formatted_full_schema`
+- `formatted_full_schema_json`
+- `table_count`
+- `value_sample_limit`
+- `source_metadata`
+
+The artifact is written to:
+
+- `data/schema_artifacts/<db_name>/versions/<schema_version>/schema_bundle.json`
+
+Example:
+
+- `data/schema_artifacts/pgim_property_finance/versions/v20260519T020431Z/schema_bundle.json`
+
+### 2.3 Manual promotion through ACTIVE_VERSION
+
+The active schema version is selected using:
+
+- `data/schema_artifacts/<db_name>/ACTIVE_VERSION`
+
+Example:
+
+- `data/schema_artifacts/pgim_property_finance/ACTIVE_VERSION`
+
+This file contains only the active version string, for example:
+
+```text
+v20260519T020431Z
+```
+
+This is the manual promotion mechanism.
+
+That means the runtime does not guess which schema version to use. It loads the exact version explicitly designated as active.
+
+---
+
+## 3. Startup-Time Schema Preload
+
+### 3.1 Why schema preload exists
+
+The current architecture is designed so that schema generation is not part of normal user request latency.
+
+Instead:
+
+- schema is built offline
+- a version is promoted manually
+- the backend preloads the active schema into memory at startup
+
+This is a more production-oriented design because it avoids:
+
+- repeated SQLite introspection on every request
+- repeated CSV parsing on every request
+- repeated sample-value extraction on every request
+- non-deterministic schema changes during user traffic
+
+### 3.2 Startup preload flow
+
+When `ambisql/server_fastapi.py` starts, the FastAPI startup hook:
+
+- `preload_active_schema_bundle`
+
+loads the active schema artifact into memory by calling:
+
+- `SchemaGenerator.preload_active_schema(...)`
+
+This does the following:
+
+1. Reads `ACTIVE_VERSION`.
+2. Locates the corresponding `schema_bundle.json`.
+3. Validates the bundle structure.
+4. Stores the loaded schema bundle in a class-level in-memory cache.
+
+If preload fails, startup raises an error instead of serving traffic with a missing or invalid schema artifact.
+
+### 3.3 Runtime schema loading behavior
+
+At request time, `SchemaGenerator` no longer needs to rebuild schema from SQLite and CSV sources.
+
+Instead:
+
+1. `AmbiguityResolver` creates a `SchemaGenerator`.
+2. `SchemaGenerator` loads the active schema bundle from the in-memory runtime cache.
+3. It exposes:
+   - `formatted_full_schema`
+   - `formatted_full_schema_json`
+   - `schema_version`
+
+This preserves the old consumer interface while changing the source of truth from "live schema build" to "prebuilt schema artifact".
+
+---
+
+## 4. Runtime Observability and Debug Logging
+
+### 4.1 Why structured logging was added
+
+The system now writes structured local logs so that it is possible to understand:
+
+- why a clarification was asked
+- how the question was interpreted
+- which schema version served the request
+- which prompt produced bad SQL or bad summarization
+- where latency accumulated
+- whether fallback behavior was triggered
+
+This is intended to support both debugging and production hardening.
+
+### 4.2 Log storage model
+
+The current logging layer writes local JSONL files.
+
+Session logs are written to:
+
+- `logs/chatbot_debug/sessions/<YYYY-MM-DD>/session_<timestamp>_<session_id>.jsonl`
+
+System logs are written to:
+
+- `logs/chatbot_debug/system/server_fastapi.jsonl`
+
+Each session gets a dedicated file so one conversation can be inspected independently.
+
+### 4.3 Request tracing model
+
+The backend now assigns:
+
+- `session_id` for the conversation
+- `request_id` for each individual API request
+
+This means one session may contain multiple request traces, such as:
+
+- one `/api/sql/analyze`
+- one or more `/api/sql/resolve`
+
+Each log record now contains enough context to isolate:
+
+- the session
+- the request
+- the component
+- the event type
+
+### 4.4 Main observability coverage
+
+The current logging captures:
+
+- startup schema preload success or failure
+- raw analyze and resolve request payloads
+- interpreted question and follow-up mode
+- schema version used for the request
+- ambiguity detection raw and filtered results
+- clarification payloads and evidence updates
+- SQL generation prompt and response
+- SQL normalization
+- SQL execution output preview
+- grounded answer prompt and response
+- fallback behavior
+- request summaries with stage latencies and usage
+
+### 4.5 Stage latency coverage
+
+The current request summaries include per-stage latency tracking for:
+
+- conversation interpretation
+- resolver initialization
+- ambiguity detection
+- ambiguity correction
+- SQL generation
+- SQL execution
+- grounded answer generation
+- total request time
+
+### 4.6 Prompt-size coverage
+
+The current LLM call logs include prompt metrics such as:
+
+- `message_count`
+- `total_characters`
+- `max_message_characters`
+
+This makes it easier to debug prompt oversizing without manually counting prompt payloads.
+
+### 4.7 Debugging guide
+
+The detailed event catalog and debugging workflow are documented in:
+
+- `docs/log_event_catalog.md`
+
+That document explains which event families to inspect first for:
+
+- wrong clarification
+- wrong SQL
+- wrong grounded answer
+- prompt oversizing
+
+---
+
+## 5. Runtime Stage One: Understanding User Intent and Asking Clarification Questions
+
+### 4.1 API entrypoint and session model
+
+The runtime process starts in `ambisql/server_fastapi.py` inside:
+
+- `analyze_sql_query`
+
+The backend maintains in-memory conversation sessions using `ChatSession`.
+
+Each session stores:
 
 - `session_id`
 - `db_name`
@@ -54,46 +310,38 @@ The backend maintains in-memory conversation sessions using the `ChatSession` cl
 - ambiguity workflow usage
 - SQL generation usage
 
-This session memory is important because the system supports conversational follow-ups instead of treating every user message as an isolated query.
+This memory is used for conversational follow-ups.
 
-### 2.2 Detecting whether the user asked a new question or a follow-up
+### 4.2 Detecting whether the user asked a new question or a follow-up
 
-Before ambiguity analysis, the backend runs `interpret_user_question` in `ambisql/server_2.py`.
+Before ambiguity analysis, the backend runs:
 
-Its purpose is to decide whether the current turn is:
+- `interpret_user_question`
 
-- a new standalone question, or
-- a follow-up modification on top of the previous question
+Its purpose is to determine whether the current user turn is:
 
-This is implemented using:
+- a new standalone question
+- or a follow-up refinement of the prior question
 
-- `FOLLOW_UP_INTERPRETATION_PROMPT` in `ambisql/server_2.py`
-- `LLMCaller` in `ambisql/utils/llm_caller.py`
-- recent chat history from `build_recent_history_text`
+This uses:
+
+- `FOLLOW_UP_INTERPRETATION_PROMPT`
+- `LLMCaller`
+- recent history from `build_recent_history_text`
 
 Technical behavior:
 
-1. If the session has no previous active question, the turn is treated as `new_question`.
-2. If the database changed between turns, the turn is also treated as `new_question`.
-3. Otherwise, an LLM is prompted with:
-   - previous active question
-   - recent message history
-   - new user message
-4. The LLM returns strict JSON:
-   - `mode`
-   - `standalone_question`
+1. If there is no previous question, the turn is `new_question`.
+2. If the selected database changes, the turn is `new_question`.
+3. Otherwise, an LLM classifies the turn and may rewrite it into a standalone question.
 
-This standalone rewrite is critical because downstream ambiguity detection and SQL generation work best on a fully explicit query rather than on elliptical follow-up fragments like:
+This rewrite is important because downstream ambiguity detection and SQL generation work better on explicit questions than on short conversational fragments.
 
-- `only top 10`
-- `what about above 90%`
-- `exclude sold properties`
+### 4.3 Constructing the ambiguity workflow context
 
-So the system first converts conversational follow-ups into a complete query before deeper analysis.
+Once the question is normalized, the backend creates:
 
-### 2.3 Building the business-aware schema representation
-
-Once the user intent is normalized into a standalone question, the backend creates an `AmbiguityResolver` from `ambisql/core/ambiguity_resolver.py`.
+- `AmbiguityResolver`
 
 Inside its constructor, it initializes:
 
@@ -102,61 +350,26 @@ Inside its constructor, it initializes:
 - `CQGenerator`
 - `LLMCaller`
 
-The most important grounding step here is `SchemaGenerator` in `ambisql/core/schema_generator.py`.
+At this point, `SchemaGenerator` does not rebuild live schema from the database. It loads the active prebuilt schema artifact and exposes the schema structures needed by the rest of the pipeline.
 
-This module does not rely only on raw SQLite schema. It merges two sources:
+### 4.4 Ambiguity detection logic
 
-1. physical schema from SQLite
-2. semantic metadata from curated `database_description/*.csv` files
+The core ambiguity engine is:
 
-For each table:
+- `AmbiguityResolver.check_ambiguity`
 
-1. It reads true column structure using `PRAGMA table_info(table)`.
-2. It reads business metadata from the corresponding CSV.
-3. It joins:
-   - column name
-   - primary key information
-   - data type
-   - column description
-   - value description
-4. It samples example values from the live database using:
-   - `SELECT DISTINCT [column_name] FROM table LIMIT 3`
-
-This produces:
-
-- `formatted_full_schema`: a text schema prompt used for SQL generation
-- `formatted_full_schema_json`: a structured dictionary used for ambiguity analysis and semantic grounding
-
-This is a key design decision: the system is not interpreting questions against bare technical table names only. It is interpreting them against a semantically enriched business schema.
-
-That business enrichment is how the model can associate natural language like:
-
-- `physical occupancy percentage`
-- `fund`
-- `valuation`
-- `property`
-
-with the most relevant tables and columns, even if the wording does not exactly match the raw SQL field names.
-
-### 2.4 Ambiguity detection logic
-
-The core ambiguity engine is `AmbiguityResolver.check_ambiguity`.
-
-It builds an LLM prompt from:
+It builds an LLM prompt using:
 
 - the current question
-- the schema JSON
+- the preloaded `formatted_full_schema_json`
 - any existing clarification evidence
-- taxonomy examples
+- ambiguity taxonomy examples
 
-using:
+These prompts come from:
 
-- `AmbiguityDetection_prompt`
-- `AmbiguityDetection_examples`
+- `ambisql/prompts/ambiguity_detection_prompt.py`
 
-from `ambisql/prompts/ambiguity_detection_prompt.py`.
-
-The ambiguity taxonomy is intentionally fine-grained. It distinguishes:
+The ambiguity taxonomy distinguishes:
 
 - Database-sourced ambiguity
   - `AmbiSchema`
@@ -168,155 +381,68 @@ The ambiguity taxonomy is intentionally fine-grained. It distinguishes:
   - `AmbiFallacy`
   - `AmbiRef`
 
-This taxonomy matters because each ambiguity type requires different clarification logic.
-
-Examples:
-
-- `AmbiSchema`: Which table or column is intended?
-- `AmbiValue`: Which stored value interpretation should be used?
-- `AmbiView`: Which SQL operation is intended?
-- `AmbiRef`: Which temporal or spatial interpretation is meant?
-
-The prompt instructs the LLM to return strict JSON containing:
+The prompt instructs the LLM to return strict JSON with:
 
 - `has_ambiguity`
 - `question_set`
 
-where each item in `question_set` includes:
+### 4.5 Guardrails against unnecessary ambiguity questions
 
-- clarification question text
-- level 1 ambiguity label
-- level 2 ambiguity label
-- structured description of plausible choices
+Ambiguity detection is LLM-driven, but deterministic post-filters reduce false positives.
 
-### 2.5 Guardrails against unnecessary ambiguity questions
-
-Ambiguity detection is LLM-based, but it is not left unfiltered. The backend applies deterministic post-processing to reduce false positives.
-
-This happens in:
+These include:
 
 - `find_exact_unique_column_matches`
 - `find_strong_natural_language_matches`
 - `has_explicit_literal_condition`
 - `filter_false_positive_ambiguities`
 
-inside `ambisql/core/ambiguity_resolver.py`.
+These routines help suppress unnecessary follow-ups when the user’s intent is already strongly grounded in the schema metadata.
 
-These routines provide several technical safeguards:
+### 4.6 Turning ambiguity items into user-friendly clarification questions
 
-#### Exact unique schema grounding
+If ambiguity remains, AmbiSQL rewrites the technical ambiguity objects into user-facing multiple-choice questions using:
 
-If the user explicitly names a column and that column is unique in the schema, the system suppresses unnecessary `AmbiSchema` follow-ups.
+- `CQGenerator.generate_clarification_question`
 
-#### Natural-language schema grounding
-
-The method `find_strong_natural_language_matches` tokenizes:
-
-- the user question
-- column names
-- column descriptions
-- value descriptions
-
-and scores lexical overlap.
-
-It also boosts important domain signals such as:
-
-- `occupancy`
-- `physical`
-- `percent`
-- `property`
-
-If one candidate column is clearly stronger than the others, the system treats the user phrase as already grounded.
-
-This is how business semantics are used to avoid asking low-value questions when intent is already reasonably inferable from the schema metadata.
-
-#### Explicit literal condition recognition
-
-If the user provides a direct condition such as:
-
-- `< 80`
-- `= 'US'`
-- `>= 0.09`
-
-the system recognizes that the value intent may already be sufficiently explicit and can suppress false `AmbiValue` prompts.
-
-### 2.6 Turning ambiguity items into user-friendly clarification questions
-
-Once ambiguity is detected, the system does not show the raw technical ambiguity object directly to the user.
-
-Instead it uses `CQGenerator` in `ambisql/core/cq_generator.py`.
-
-This module:
+This stage:
 
 1. takes each ambiguity item
 2. reads its description
-3. prompts the LLM to rewrite it into simpler, human-friendly multiple-choice options
-4. validates the response as JSON
-5. attaches the resulting `choices` array
+3. prompts the LLM to simplify it
+4. validates the JSON response
+5. attaches a `choices` list
 
-This separation is important:
+### 4.7 Clarification memory
 
-- ambiguity detection decides what is unclear
-- clarification question generation decides how to ask the user about it
+When the user answers follow-up questions, their selections are stored in:
 
-That makes the interaction both technically grounded and business-friendly.
+- `PreferenceTree`
 
-### 2.7 Clarification memory and residual ambiguity resolution
+This structure organizes clarification evidence by ambiguity class and merges semantically overlapping answers when necessary.
 
-When the user answers clarification questions, the backend processes them in `resolve_ambiguities` and passes them into `AmbiguityResolver.ambi_correction`.
+The evidence summary returned by:
 
-Clarifications are stored in a structured evidence model called `PreferenceTree` in `ambisql/core/preference_index.py`.
+- `PreferenceTree.traverse()`
 
-The tree groups evidence by:
-
-- level 1 ambiguity class
-- level 2 ambiguity class
-
-Each leaf stores question-answer pairs.
-
-If a new answer overlaps semantically with an existing answer, `node_merge` uses an LLM to merge or replace the old evidence instead of appending redundant records.
-
-This design is useful in multi-turn chats because it prevents evidence drift and allows later prompts to receive a clean summary of user decisions rather than an uncontrolled transcript.
-
-The evidence tree is then traversed into a compact text representation using `PreferenceTree.traverse()`, which becomes part of the next ambiguity-detection or SQL-generation context.
-
-This means the system does not merely remember past messages. It remembers past decisions in a structured intent model.
+is later injected into ambiguity redetection and SQL generation.
 
 ---
 
-## 3. Stage Two: Mapping Business Tables to Clarified Intent and Generating SQL
+## 6. Runtime Stage Two: Mapping Business Tables to Clarified Intent and Generating SQL
 
-### 3.1 Why the schema is business-grounded rather than only structural
+### 5.1 Why the prebuilt schema still provides strong semantic grounding
 
-The SQL generation stage depends heavily on the schema object produced earlier.
+Even though schema is now loaded from a versioned artifact instead of rebuilt live during requests, the contents of that artifact still carry the same business-rich grounding:
 
-The most important design choice is that the model receives:
-
-- physical schema structure
-- business descriptions
+- physical SQLite schema
+- column descriptions
 - value descriptions
-- sample values
+- sampled example values collected during artifact build
 
-instead of only raw table and column names.
+That means SQL generation remains grounded in business semantics rather than raw technical names only.
 
-This creates a semantic bridge between business language and SQL language.
-
-For example, if a user asks for:
-
-- `highest physical occupancy`
-- `funds with net IRR above 9%`
-- `property valuation`
-
-the model can associate business terminology with:
-
-- likely fact tables
-- likely dimension tables
-- likely metric fields
-- likely join anchors
-
-That is how the system restricts itself to asking relevant questions from business tables rather than asking abstract or ungrounded follow-ups.
-
-### 3.2 Clarified intent package used for SQL generation
+### 5.2 Clarified intent package used for SQL generation
 
 After ambiguity resolution completes, `AmbiguityResolver.format_response` returns:
 
@@ -324,516 +450,425 @@ After ambiguity resolution completes, `AmbiguityResolver.format_response` return
 - refined `question`
 - `evidence`
 
-The `evidence` field is the structured preference trace from `PreferenceTree.traverse()`.
+This evidence explicitly records:
 
-This evidence is important because it explicitly tells downstream generation:
+- selected interpretations
+- chosen columns or filters
+- added constraints
+- follow-up clarifications
 
-- which column interpretation the user chose
-- which filter interpretation was selected
-- which temporal or business reference was intended
-- which constraints were added later
+### 5.3 SQL generation implementation
 
-So the SQL generator is not guessing from the original user utterance alone. It works from:
+SQL generation happens in:
 
-1. normalized question
-2. accumulated clarification evidence
-3. business-grounded schema
+- `ambisql/utils/nl2sql_agent.py`
 
-### 3.3 SQL generation implementation
+through:
 
-SQL generation happens in `ambisql/utils/nl2sql_agent.py` through the `XiYanAgent` class.
+- `XiYanAgent.generate_sql(question, evidence, schema)`
 
-The pipeline is:
+The prompt includes:
 
-1. Build prompt using `xiyan_template_en`
-2. Inject:
-   - `dialect`
-   - clarified `question`
-   - full business-grounded schema text
-   - clarification `evidence`
-3. Send prompt to `gpt-4o-mini`
-4. Return generated SQL text
+- SQL dialect
+- clarified question
+- full business-grounded schema text
+- clarification evidence
 
-The key method is `XiYanAgent.generate_sql(question, evidence, schema)`.
+This produces the SQL statement used for execution.
 
-This method is prompt-based, but it is constrained by strong grounding inputs:
+### 5.4 SQL normalization before execution
 
-- the clarified natural-language intent
-- the full schema with business descriptions
-- the explicit evidence trail from prior clarifications
-
-This is the main semantic mapping mechanism from business language to SQL.
-
-### 3.4 Why clarification reduces SQL error
-
-Without clarification, one business phrase may correspond to multiple plausible SQL expressions.
-
-Examples:
-
-- multiple candidate metric columns
-- multiple time interpretations
-- multiple business definitions of `top`, `high`, or `active`
-- multiple stored value representations
-
-Clarification narrows the search space before SQL generation.
-
-Technically, this reduces error in two ways:
-
-1. It reduces prompt ambiguity before generation.
-2. It injects explicit user-selected evidence back into the SQL generation prompt.
-
-So instead of asking the LLM to infer both:
-
-- what the user means
-- how to translate that meaning into SQL
-
-the pipeline decomposes the task:
-
-- first resolve intent
-- then translate resolved intent into SQL
-
-That decomposition is the main reason the system is more reliable than a direct one-shot text-to-SQL call.
-
-### 3.5 SQL normalization before execution
-
-Generated SQL is normalized before execution inside `ambisql/server_2.py`.
-
-Two helper functions are used:
+Before execution, the backend normalizes model output using:
 
 - `normalize_sql_query`
 - `add_semicolon_if_missing`
 
-These ensure that:
-
-- markdown code fences are stripped
-- the final SQL ends with a semicolon
-
-This is a small but practical hardening step that prevents execution failures caused by formatting artifacts from the model output.
+This strips markdown fences and ensures the query ends with a semicolon.
 
 ---
 
-## 4. Stage Three: Executing SQL and Generating the Final Response with Citations
+## 7. Runtime Stage Three: Executing SQL and Generating the Final Response
 
-### 4.1 SQL execution
+### 6.1 SQL execution
 
-Once the final SQL is generated, the backend executes it using `execute_query` in `ambisql/utils/db_utils.py`.
+The generated SQL is executed using:
 
-This function:
+- `execute_query` in `ambisql/utils/db_utils.py`
 
-1. opens a SQLite connection using:
-   - `path/db_name/db_name.sqlite`
-2. executes the SQL query
-3. if the statement is `SELECT` or `WITH`, fetches:
-   - column names from `cursor.description`
-   - rows from `cursor.fetchall()`
-4. closes the connection
-5. returns either:
-   - raw rows, or
-   - `{columns, rows}` when `include_columns=True`
+This opens:
 
-In the FastAPI server, execution is done with `include_columns=True` so the backend can later build:
+- `path/db_name/db_name.sqlite`
 
-- grounded answers
-- result previews
-- citations
-- query metadata
+and returns:
 
-### 4.2 Grounded answer generation
+- column names
+- result rows
 
-The system does not directly show raw SQL output as the final answer. It converts the returned result set into a natural-language answer using `build_grounded_answer` in `ambisql/server_2.py`.
+### 6.2 Grounded answer generation
 
-This method works as follows:
+The final answer is generated using:
 
-1. If zero rows are returned:
-   - return a deterministic answer saying no matching rows were found
-   - attach a `[query result]` citation
-2. Otherwise:
-   - build a structured preview of the first result rows via `build_result_preview`
-   - prompt the LLM with:
-     - original clarified question
-     - executed SQL
-     - row count
-     - structured result preview
-   - require strict JSON output with:
-     - `answer`
-     - `citations`
+- `build_grounded_answer`
 
-This is a grounded summarization step, not an open-ended answer generation step.
+If zero rows are returned:
 
-The prompt explicitly tells the model:
+- the backend returns a deterministic no-results answer
 
-- use only the supplied SQL result
-- do not guess
-- include inline citation markers
+Otherwise:
 
-That means the answer is based on returned database rows rather than on the model’s world knowledge.
+1. it packages result rows using `build_result_rows`
+2. it sends the executed SQL, row count, and result rows into `GROUNDED_ANSWER_PROMPT`
+3. it asks the LLM to return strict JSON with:
+   - `answer`
+   - `citations`
 
-### 4.3 Query metadata extraction for traceability
+Important implementation detail:
 
-To improve traceability, the backend also extracts query metadata using `extract_query_metadata` in `ambisql/server_2.py`.
+- the current helper limits the result rows sent to the answer model to the first 20 rows
+- the API response also limits the visible query preview to the first 20 rows
 
-This routine scans the generated SQL and compares it against `formatted_full_schema_json` to infer:
+So the answer is grounded in SQL output, but in the current code path the grounded-answer prompt is still capped to a bounded row set for practicality.
+
+### 6.3 Query metadata extraction
+
+The backend extracts lightweight traceability metadata using:
+
+- `extract_query_metadata`
+
+This infers:
 
 - `tables_used`
 - `columns_used`
 - `row_count`
 
-Important behavior:
+and turns it into a citation via:
 
-- it only includes columns that appear to be referenced by the SQL
-- if explicit columns cannot be detected reliably, it falls back to result columns
+- `build_query_metadata_citation`
 
-This metadata is then converted into a citation object by `build_query_metadata_citation`.
+### 6.4 Fallback citations
 
-This allows the UI to explain not only what the answer is, but also:
+If grounded-answer JSON parsing fails, the backend falls back to deterministic row citations using:
 
-- which business tables participated
-- which columns were used
-- how many rows were returned
+- `build_result_citations`
 
-### 4.4 Row-level citations
+This ensures traceability is still returned even when summarization is imperfect.
 
-If grounded answer generation succeeds, the model returns citations such as:
+### 6.5 Final response payload
 
-- `[rows 1-3]`
-- `[row 1]`
-
-If grounded answer generation fails or returns malformed JSON, the backend falls back to deterministic row-level evidence using `build_result_citations`.
-
-That fallback ensures the system still returns traceability information even when the LLM summarization step is imperfect.
-
-### 4.5 Final response payload returned to the UI
-
-When a query is fully resolved and executed, the backend returns a payload containing:
+When the query is fully resolved and executed, the backend returns:
 
 - `sql_statement_clarified`
 - `grounded_answer`
 - `citations`
 - `query_metadata`
 - `query_result`
+- `confidence`
 - `monitoring`
 
-This is what makes the final UI answer explainable.
-
-The UI can show:
+The frontend can then display:
 
 - the generated SQL
-- the natural-language answer
-- the tables used
-- the columns used
-- the number of returned rows
+- the answer
 - query result preview
-- token/cost monitoring
-
-This combination allows the system to demonstrate both:
-
-- functional correctness
-- operational traceability
+- citations
+- confidence score
+- usage monitoring
 
 ---
 
-## 5. Why the Answer is More Accurate Than a Direct Chatbot Guess
+## 8. Confidence Score Logic
 
-The current implementation improves answer reliability because it does not let the model answer from natural language alone.
+The confidence score in the UI is implemented by:
 
-It introduces three strong grounding layers:
+- `build_confidence_report` in `ambisql/server_fastapi.py`
 
-### Layer 1: Intent grounding
+It is not a probability and not a benchmark metric. It is a deterministic heuristic based on pipeline checkpoints.
 
-The system interprets follow-ups, detects ambiguity, and asks clarification questions before SQL generation.
+The current weighted factors are:
 
-### Layer 2: Schema grounding
+1. Conversation interpretation: 5
+2. Intent clarity: 25
+3. SQL generation: 20
+4. SQL execution: 25
+5. Result grounding: 15
+6. Traceability: 10
 
-The system maps user language to a business-enriched schema built from:
+The total is 100 points, so the score can be displayed directly as a percentage.
 
-- actual SQLite structure
-- curated business descriptions
-- sample values
-
-### Layer 3: Result grounding
-
-The system executes the SQL on the real database and builds the final answer only from the returned rows.
-
-That means the model is used in three controlled roles:
-
-- ambiguity classifier
-- clarification generator
-- grounded result summarizer
-
-It is not used as an unconstrained answer source.
-
----
-
-## 6. Technical Strengths of the Current Design
-
-### 6.1 Separation of responsibilities
-
-The system decomposes the problem into modular stages:
-
-- conversational interpretation
-- ambiguity detection
-- clarification question generation
-- intent memory
-- SQL generation
-- SQL execution
-- grounded answer generation
-
-This makes the pipeline easier to debug and explain.
-
-### 6.2 Business-semantic schema grounding
-
-The use of `database_description/*.csv` plus live example values gives the model domain context it would not get from raw DDL alone.
-
-### 6.3 Structured memory
-
-The `PreferenceTree` stores resolved intent as reusable evidence rather than just as loose chat history.
-
-### 6.4 Traceable final answer
-
-Because the final answer is generated from executed rows and includes metadata citations, the UI can justify how the answer was produced.
-
----
-
-## 7. Current Limitations
-
-For completeness, the current implementation also has some practical limits:
-
-### 7.1 In-memory sessions
-
-Sessions are stored in memory only. Restarting the backend clears all history.
-
-### 7.2 SQL metadata extraction is heuristic
-
-`extract_query_metadata` uses SQL string matching against schema names. It works well for many queries but is not a full SQL parser.
-
-### 7.3 Grounded answer still uses an LLM summarizer
-
-The final answer is grounded in rows, but phrasing is still generated by an LLM. The raw result preview and citations remain the safety mechanism for verification.
-
-### 7.4 Schema quality depends on metadata quality
-
-Business grounding is only as strong as the `database_description` CSVs. Poor descriptions reduce semantic alignment quality.
-
----
-
-## 8. Summary
-
-The current AmbiSQL backend is not simply generating SQL from a prompt. It is performing a multi-stage grounded reasoning workflow:
-
-1. Understand whether the user asked a new or follow-up question.
-2. Build a business-aware schema representation from structural and semantic metadata.
-3. Detect unresolved ambiguity using a taxonomy-driven LLM prompt.
-4. Ask targeted clarification questions when intent is underspecified.
-5. Store clarification decisions in a structured evidence tree.
-6. Generate SQL from clarified intent plus schema plus evidence.
-7. Execute the SQL against the actual database.
-8. Generate a grounded natural-language answer from the returned rows.
-9. Return citations and query metadata for traceability.
-
-This design is what allows the system to be both interactive and explainable, and it is the core reason it is more trustworthy than a direct natural-language chatbot response.
-
----
-
-## 9. Confidence Score Logic
-
-The UI confidence score is implemented as a deterministic execution-confidence heuristic in `ambisql/server_2.py`. It is not a model probability and it is not a benchmark accuracy metric. Instead, it is a weighted score derived from concrete checkpoints in the AmbiSQL pipeline.
-
-The purpose of this score is to communicate answer reliability to end users in a transparent and explainable way.
-
-### 9.1 Why a heuristic score is used
-
-At runtime, the system usually does not have ground-truth SQL or ground-truth answers for the user’s question. Because of that, the backend cannot honestly compute true accuracy on the fly.
-
-What it can compute is how many reliability checkpoints were successfully passed, such as:
-
-- whether the user intent was interpreted cleanly
-- whether ambiguity was resolved
-- whether SQL was generated
-- whether SQL executed successfully
-- whether the final answer was grounded in actual returned rows
-- whether traceability metadata was extracted
-
-This is why the system uses a weighted confidence heuristic instead of a probabilistic accuracy estimate.
-
-### 9.2 Implementation location
-
-The confidence score is produced by `build_confidence_report` in `ambisql/server_2.py`.
-
-This function returns:
-
-- `score_percentage`
-- `label`
-- `summary`
-- `calculation_note`
-- `factors`
-
-Each factor contains:
-
-- `name`
-- `earned_points`
-- `max_points`
-- `detail`
-
-The total maximum is 100 points, so the final confidence score is directly expressed as a percentage.
-
-### 9.3 Confidence score formula
-
-The current score is composed of six weighted factors:
-
-1. `Conversation interpretation` out of 5
-2. `Intent clarity` out of 25
-3. `SQL generation` out of 20
-4. `SQL execution` out of 25
-5. `Result grounding` out of 15
-6. `Traceability` out of 10
-
-The full formula is:
-
-```text
-Confidence Score (%) =
-Conversation interpretation
-+ Intent clarity
-+ SQL generation
-+ SQL execution
-+ Result grounding
-+ Traceability
-```
-
-Because the weights sum to 100, the final numeric score is already a percentage.
-
-### 9.4 Factor-by-factor technical logic
-
-#### A. Conversation interpretation: 0 to 5 points
-
-This measures whether the system successfully normalized the user turn into a standalone analytical question.
-
-Logic:
-
-- `5/5` if the question was classified as either `new_question` or `follow_up`
-- `0/5` otherwise
-
-This stage is implemented using:
-
-- `interpret_user_question`
-- `FOLLOW_UP_INTERPRETATION_PROMPT`
-- session history from `build_recent_history_text`
-
-#### B. Intent clarity: 10 to 25 points
-
-This measures whether ambiguity was resolved before query generation.
-
-Logic:
-
-- `25/25` if the request is fully clarified
-- `10/25` if clarification questions are still pending
-- `18/25` if the system currently considers the question clear but SQL generation has not yet completed
-
-This factor uses the ambiguity workflow output from:
-
-- `AmbiguityResolver.check_ambiguity`
-- `AmbiguityResolver.ambi_detection`
-- `AmbiguityResolver.ambi_correction`
-
-#### C. SQL generation: 0 to 20 points
-
-This measures whether a concrete SQL statement was successfully generated.
-
-Logic:
-
-- `20/20` if SQL was produced
-- `0/20` otherwise
-
-This stage is implemented by:
-
-- `XiYanAgent.generate_sql`
-
-#### D. SQL execution: 0 to 25 points
-
-This measures whether the generated SQL actually ran against the SQLite database.
-
-Logic:
-
-- `25/25` if execution succeeded
-- `0/25` otherwise
-
-This is implemented through:
-
-- `execute_query` in `ambisql/utils/db_utils.py`
-
-This is one of the most important reliability factors because it ensures the answer is based on executable database logic rather than on an unverified generated query.
-
-#### E. Result grounding: 0 to 15 points
-
-This measures whether the final answer was grounded in returned rows.
-
-Logic:
-
-- `15/15` if a grounded answer was produced from a non-empty result set
-- `8/15` if the SQL executed successfully but returned zero rows and the answer reflects that empty result honestly
-- `0/15` if no grounded answer exists
-
-This stage is implemented by:
-
-- `build_grounded_answer`
-- `build_result_preview`
-
-This factor explicitly rewards answer generation from real query results rather than from general model reasoning.
-
-#### F. Traceability: 0 to 10 points
-
-This measures whether the system can explain how the answer was produced.
-
-Logic:
-
-- `10/10` if query metadata includes both detected tables and detected columns
-- `6/10` if only partial metadata is available
-- `0/10` if no metadata or citations are available
-
-This is implemented through:
-
-- `extract_query_metadata`
-- `build_query_metadata_citation`
-
-This factor rewards transparency and auditability.
-
-### 9.5 Confidence labels
-
-The numeric score is converted into a qualitative label:
+Current labels are:
 
 - `85-100`: High confidence
 - `65-84`: Moderate confidence
 - `45-64`: Provisional confidence
 - `0-44`: Low confidence
 
-This label is what the UI shows alongside the percentage for easier interpretation by non-technical users.
+---
 
-### 9.6 Example interpretation
+## 9. Why This Design Is More Reliable Than a Direct Chatbot Guess
 
-If the system:
+The current implementation improves reliability through three controlled grounding layers:
 
-- understands the question correctly
-- resolves all ambiguity
-- generates SQL
-- executes SQL successfully
-- produces an answer from returned rows
-- identifies the tables and columns used
+### Layer 1: Intent grounding
 
-then the score can reach `100%`.
+The system interprets conversational follow-ups, detects ambiguity, and asks clarification questions.
 
-If ambiguity is still unresolved and no SQL has been generated yet, the score remains low because the pipeline has not yet passed the key reliability checkpoints.
+### Layer 2: Schema grounding
 
-If SQL runs successfully but returns zero rows, the score can still remain moderately high because:
+The system uses a business-aware schema artifact built from:
 
-- execution succeeded
-- the response is honest
-- the answer is still grounded in the real database result
+- actual SQLite structure
+- curated business descriptions
+- sampled example values
 
-but it receives fewer points for result grounding.
+### Layer 3: Result grounding
 
-### 9.7 UI interpretation
+The system executes the SQL and generates the answer from the returned rows instead of answering directly from world knowledge.
 
-The confidence score shown in the UI should be explained as:
+This means the model is used in constrained roles:
 
-`This percentage reflects how many reliability checkpoints the system successfully completed, including ambiguity resolution, SQL generation, SQL execution, grounding in returned rows, and citation-based traceability.`
+- ambiguity classifier
+- clarification question generator
+- SQL generator
+- grounded summarizer
 
-That framing is technically honest and also clear for demo audiences and clients.
+not as an unconstrained answer engine.
+
+---
+
+## 10. Current Technical Strengths
+
+### 10.1 Separation of build-time and run-time schema logic
+
+Schema preparation is now split into:
+
+- offline schema artifact build
+- startup preload
+- request-time reuse
+
+This is a cleaner production-oriented pattern than rebuilding schema on every query.
+
+### 10.2 Business-semantic schema grounding
+
+The schema artifact preserves domain semantics through metadata CSVs and sample values.
+
+### 10.3 Structured clarification memory
+
+`PreferenceTree` stores reusable intent evidence rather than raw chat text only.
+
+### 10.4 Traceable final answer
+
+The final answer includes query metadata and citations grounded in the executed SQL result.
+
+### 10.5 Structured debug observability
+
+The backend now emits structured session logs, request summaries, prompt metrics, and fallback traces, which makes production debugging much more practical than console output alone.
+
+---
+
+## 11. Current Limitations
+
+### 11.1 In-memory sessions
+
+Conversation sessions are still stored only in process memory. Restarting the backend clears them.
+
+### 11.2 Manual schema promotion
+
+Schema artifact activation currently depends on a local `ACTIVE_VERSION` file and manual rebuild/promotion workflow.
+
+### 11.3 SQL metadata extraction is heuristic
+
+`extract_query_metadata` is based on SQL string matching, not a full SQL parser.
+
+### 11.4 Grounded answer row cap
+
+The current implementation limits the rows sent to the summarization prompt, which helps control prompt size but can underrepresent very large result sets.
+
+### 11.5 Schema quality depends on metadata quality
+
+The usefulness of the schema artifact still depends heavily on the quality of `database_description/*.csv`.
+
+### 11.6 Local-file observability only
+
+The current observability layer is local and file-based. It does not yet provide:
+
+- centralized log aggregation
+- dashboards
+- alerting
+- distributed tracing
+- long-term operational metrics storage
+
+---
+
+## 12. End-to-End Runbook: Run the Project from Scratch
+
+This section describes how to set up and run the full project locally from scratch.
+
+### 12.1 Prerequisites
+
+Install:
+
+- Python 3.10+
+- Node.js and npm
+
+You also need an OpenAI API key because the backend uses `gpt-4o-mini`.
+
+### 12.2 Create and activate a Python environment
+
+From the project root:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+### 12.3 Configure environment variables
+
+Create or update `.env` in the project root with at least:
+
+```env
+OPENAI_API_KEY=your_openai_api_key_here
+DEFAULT_DB_NAME=pgim_property_finance
+PORT=8765
+```
+
+### 12.4 Build the local SQLite database and metadata from the Excel file
+
+If you want to rebuild the local database from the workbook, run:
+
+```powershell
+python scripts\import_pgim_excel.py
+```
+
+This creates:
+
+- `MINIDEV/dev_databases/pgim_property_finance/pgim_property_finance.sqlite`
+- `MINIDEV/dev_databases/pgim_property_finance/database_description/*.csv`
+
+If these already exist and are valid, you can skip this step.
+
+### 12.5 Build and activate the schema artifact
+
+Run:
+
+```powershell
+python scripts\build_schema_artifact.py --db-name pgim_property_finance --activate
+```
+
+This creates:
+
+- `data/schema_artifacts/pgim_property_finance/versions/<version>/schema_bundle.json`
+- `data/schema_artifacts/pgim_property_finance/ACTIVE_VERSION`
+
+This step is required whenever you want to promote a newly built schema bundle.
+
+### 12.6 Start the backend
+
+Run:
+
+```powershell
+python ambisql\server_fastapi.py
+```
+
+At startup, the backend will:
+
+1. read `DEFAULT_DB_NAME`
+2. load the active schema artifact for that DB
+3. preload it into memory
+4. fail startup if the active schema artifact is missing or invalid
+
+By default the backend runs on:
+
+- `http://localhost:8765`
+
+You can confirm it is healthy with:
+
+- `GET /health`
+
+During runtime, the backend will also create local debug logs automatically under:
+
+- `logs/chatbot_debug/`
+
+### 12.7 Start the frontend
+
+In a second terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+The frontend talks to:
+
+- `http://localhost:8765/api/sql`
+
+The frontend default database selection is currently:
+
+- `pgim_property_finance`
+
+### 12.8 End-to-end runtime flow after startup
+
+Once both frontend and backend are running:
+
+1. Open the frontend in the browser.
+2. Enter a natural-language business question.
+3. The frontend calls `POST /api/sql/analyze`.
+4. The backend:
+   - interprets the turn
+   - loads the preloaded schema from memory
+   - runs ambiguity detection
+5. If needed, the frontend renders clarification questions.
+6. The frontend submits user clarifications to `POST /api/sql/resolve`.
+7. The backend:
+   - updates clarification memory
+   - generates SQL
+   - executes SQL
+   - generates grounded answer and citations
+8. The UI displays:
+   - the answer
+   - the SQL
+   - query result preview
+   - citations
+   - confidence score
+   - usage monitoring
+9. The backend writes structured session and request logs for debugging and observability.
+
+### 12.9 When schema changes
+
+If the SQLite schema or metadata CSV files change:
+
+1. rebuild the database and metadata if needed
+2. build a new schema artifact
+3. activate the new version
+4. restart the backend
+
+Typical commands:
+
+```powershell
+python scripts\import_pgim_excel.py
+python scripts\build_schema_artifact.py --db-name pgim_property_finance --activate
+python ambisql\server_fastapi.py
+```
+
+---
+
+## 13. Summary
+
+The current AmbiSQL backend is a multi-stage grounded reasoning workflow:
+
+1. Prepare database and metadata offline.
+2. Build a versioned schema artifact offline.
+3. Promote one schema version through `ACTIVE_VERSION`.
+4. Preload the active schema artifact into memory at startup.
+5. Interpret whether the user turn is a new question or follow-up.
+6. Detect unresolved ambiguity using taxonomy-guided prompting plus deterministic filters.
+7. Ask targeted clarification questions when needed.
+8. Store clarification decisions in structured evidence memory.
+9. Generate SQL from clarified intent plus preloaded business schema plus evidence.
+10. Execute the SQL on the SQLite database.
+11. Generate a grounded answer from the SQL result rows.
+12. Write structured logs for startup, requests, prompts, SQL execution, and fallback behavior.
+13. Return answer, SQL, citations, confidence, and monitoring data.
+
+This design is more production-worthy than request-time schema generation because schema preparation is now explicit, versioned, promotable, and reusable across all user queries.

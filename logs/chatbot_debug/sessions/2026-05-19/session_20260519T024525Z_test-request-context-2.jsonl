@@ -1,0 +1,1 @@
+{"timestamp_utc": "2026-05-19T02:45:25.917242+00:00", "level": "INFO", "channel": "session", "session_id": "test-request-context-2", "request_id": "req_abc", "component": "test", "event": "summary_check", "payload": {"stage_latencies_ms": {"x": 1.23}, "estimated_cost_usd": 0.0004}}

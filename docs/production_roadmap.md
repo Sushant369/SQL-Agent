@@ -14,7 +14,7 @@ The primary focus areas are:
 
 The roadmap is written against the current architecture centered on:
 
-- [ambisql/server_2.py](../ambisql/server_2.py)
+- [ambisql/server_fastapi.py](../ambisql/server_fastapi.py)
 - [ambisql/core/ambiguity_resolver.py](../ambisql/core/ambiguity_resolver.py)
 - [ambisql/core/cq_generator.py](../ambisql/core/cq_generator.py)
 - [ambisql/core/preference_index.py](../ambisql/core/preference_index.py)
