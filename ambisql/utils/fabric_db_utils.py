@@ -1,3 +1,28 @@
+# FABRIC_DATA_SOURCE=tcp:<your-server>.database.fabric.microsoft.com,1433
+# FABRIC_DATABASE=<your_database_name>
+# FABRIC_USER_ID=<your_email_or_user_if_needed>
+# FABRIC_AUTHENTICATION=ActiveDirectoryInteractive
+# FABRIC_DRIVER={ODBC Driver 18 for SQL Server}
+
+# FABRIC_CONNECTION_STRING=Driver={ODBC Driver 18 for SQL Server};Data Source=tcp:<your-server>.database.fabric.microsoft.com,1433;Initial Catalog=<your_database_name>;Authentication=ActiveDirectoryInteractive;Pooling=False;Encrypt=yes;TrustServerCertificate=no;
+
+# @'
+# from dotenv import load_dotenv
+# from ambisql.utils.fabric_db_utils import execute_fabric_query
+
+# load_dotenv()
+
+# result = execute_fabric_query(
+#     "SELECT TOP 5 * FROM INFORMATION_SCHEMA.TABLES",
+#     include_columns=True
+# )
+
+# print(result["columns"])
+# for row in result["rows"]:
+#     print(row)
+# '@ | python -
+
+
 import os
 from typing import Any, Dict, List, Optional
 
